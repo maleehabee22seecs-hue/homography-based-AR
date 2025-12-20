@@ -19,42 +19,28 @@ def decompose_homography(H, K, prev_R=None):
         t = Ts[i].flatten()
         
         # Score 1: Normal alignment with Z (0,0,1)
+        # We want normal to point TOWARDS camera for a visible surface.
+        # In this conv, camera looks down +Z? No, usually -Z or +Z.
+        # Let's assume standard view: Normal should have large Z component.
         score_z = abs(n[2])
         
-        # Score 2: Positive Depth Check
-        # If we transform a point on the plane (e.g. 0,0,1 or 0,0,0) with this R,t, does it land in front?
-        # Standard H decomp: x_cam = R * x_plane + t * d
-        # Let's test the center of the plane (0,0,0) or (0,0,1).
-        # Actually t itself is the position of the plane origin in cam frame (scaled by d).
-        # So we really just want t[2] to be POSITIVE (in front of camera) OR
-        # if the normal implies we're looking AT the plane.
+        # KEY FIX: Ensure the normal points roughly towards the camera.
+        # If n[2] is negative, it might be facing away depending on coord sys.
+        # We prefer solutions where t[2] is positive (object in front).
         
-        # In most AR cases, the plane is in front of the camera.
-        # But cv2.decomposeHomographyMat returns t normalized by d (depth of plane).
-        # If d is positive (plane in front), then t[2] should roughly generally be positive.
-        
-        # Let's enforce that the camera is on the side of the plane defined by normal?
-        # Actually simpler: standard decompositoin returns 4 solutions:
-        # 2 are "in front", 2 are "behind".
-        # We MUST pick one where the point is in front.
-        
-        # Check Z component of translation (scaled).
-        # Ideally t[2] should be positive if the origin of the plane is in front.
-        # But this depends on where the origin is.
-        # Let's assume the tracked feature centroid is roughly at (0,0,0) of the plane coord system.
-        
-        is_in_front = 1.0 if t[2] > 0 else -1.0
+        is_in_front = 1.0 if t[2] > 0 else -10.0 # Heavy penalty if behind
         
         score_consistency = 0.0
         if prev_R is not None:
+             # Dot product of rotation vectors or trace of R*R.T
              score_consistency = np.trace(R @ prev_R.T)
         
         # Weighted combination
-        # Huge penalty for being behind camera
+        # Prioritize "In Front" and "Consistent"
         if prev_R is not None:
-            total_score = score_z + 2.0 * score_consistency + 5.0 * is_in_front
+            total_score = score_z + 5.0 * score_consistency + 10.0 * is_in_front
         else:
-            total_score = score_z + 5.0 * is_in_front
+            total_score = score_z + 10.0 * is_in_front
 
         if total_score > best_score:
             best_score = total_score
@@ -63,7 +49,7 @@ def decompose_homography(H, K, prev_R=None):
     return Rs[best_idx], Ts[best_idx]
 
 class PoseFilter:
-    def __init__(self, alpha=0.3):
+    def __init__(self, alpha=0.1):
         self.alpha = alpha
         self.R_curr = np.eye(3)
         self.t_curr = np.zeros((3,1))

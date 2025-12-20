@@ -1,234 +1,238 @@
 import cv2
 import numpy as np
+import argparse
+import os
+import sys
 from placement import PlacementController
 from tracker import FeatureTracker
 from renderer_3d import MeshRenderer3D
 from pose import decompose_homography, PoseFilter
 
-VIDEO = "C:/Users/Maleeha/OneDrive/Desktop/A/data/input_video.mp4"
-MODEL = "C:/Users/Maleeha/OneDrive/Desktop/A/data/object3d.obj"
-cap = None # Will be initialized in main
-# ret, frame0 = cap.read() # Moved to main
-# if not ret:
-#     raise RuntimeError("Can't open video")
-# h, w = frame0.shape[:2] # This logic is problematic here if video capture isn't open
-# Just placeholder needed for width/height? 
-# K_cal needs w_vid, h_vid. 
-# Let's open briefly to get size then release, or just do it inside main logic?
-# The code below uses w_vid, h_vid immediately.
-cap_temp = cv2.VideoCapture(VIDEO)
-ret, frame0 = cap_temp.read()
-if ret:
-    h_vid, w_vid = frame0.shape[:2]
-    print("Video frame size (w,h):", (w_vid, h_vid))
-cap_temp.release()
-   
+# Default Paths (Relative to the script execution or hardcoded fallback)
+DEFAULT_VIDEO = os.path.join(os.path.dirname(__file__), "../data/input_video.mp4")
+DEFAULT_MODEL = os.path.join(os.path.dirname(__file__), "../data/chair.glb")
 
-
-
-# https://stackoverflow.com/questions/78072261/how-to-find-cameras-intrinsic-matrix-from-focal-length
-import numpy as np
-
-# calibrated values (from multi-image calibration)
+# Camera Calibration Data (Samsung A52 / Example)
+# NOTE: In a real production app, this should be loaded from a file.
 K_cal = np.array([[969.8165, 0.0, 292.3732],
                   [  0.0, 983.1865, 675.59],
                   [  0.0, 0.0, 1.0 ]])
 
 dist_cal = np.array([ 0.2558, -3.947,  -0.0013,  0.0069, 14.6611])
+w_cal, h_cal = 564, 1280
 
-# ret, frame0 = cap.read() # Redundant, already got frame0 from cap_temp
-# h_vid, w_vid = frame0.shape[:2] # Already set above
+def get_camera_matrix(w_vid, h_vid):
+    scale_x = w_vid / w_cal
+    scale_y = h_vid / h_cal
+    K = K_cal.copy()
+    K[0,0] *= scale_x; K[0,1] *= scale_x
+    K[1,1] *= scale_y; K[1,2] *= scale_y
+    return K
 
-
-# if calibration image size differs, scale K:
-w_cal, h_cal = 564, 1280   # values used for calibration
-scale_x = w_vid / w_cal
-scale_y = h_vid / h_cal
-K = K_cal.copy()
-K[0,0] *= scale_x; K[0,1] *= scale_x
-K[1,1] *= scale_y; K[1,2] *= scale_y
-
-# optional undistort maps
-newK, roi = cv2.getOptimalNewCameraMatrix(K, dist_cal, (w_vid,h_vid), alpha=0)
-map1, map2 = cv2.initUndistortRectifyMap(K, dist_cal, None, newK, (w_vid,h_vid), cv2.CV_16SC2)
-
-
+def get_generic_calibration(w_vid, h_vid, fov_deg=60.0):
+    f = max(w_vid, h_vid) / (2 * np.tan(np.radians(fov_deg/2)))
+    cx = w_vid / 2.0
+    cy = h_vid / 2.0
+    K = np.array([[f, 0, cx],
+                  [0, f, cy],
+                  [0, 0, 1.0]])
+    return K
 
 def main():
-    cap = cv2.VideoCapture(VIDEO)
+    parser = argparse.ArgumentParser(description="Homography-based AR Object Placement")
+    parser.add_argument("--video", type=str, default=DEFAULT_VIDEO, help="Path to input video")
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL, help="Path to 3D OBJ model")
+    args = parser.parse_args()
+
+    # Verify files
+    # Try to parse video as integer for webcam
+    video_source = args.video
+    if args.video.isdigit():
+        video_source = int(args.video)
+
+    cap = cv2.VideoCapture(video_source)
     if not cap.isOpened():
-        print(f"Error: Could not open video source {VIDEO}")
+        print(f"Error: Could not open video source {video_source}")
         return
 
     ret, frame0 = cap.read()
     if not ret:
-        print("Error: Could not read frame")
+        print("Error: Could not read first frame")
         return
         
-    print(f"Video opened successfully. Frame shape: {frame0.shape}")
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"Total frames in video: {frame_count}")
-    h, w = frame0.shape[:2]
+    h_vid, w_vid = frame0.shape[:2]
+    print(f"Video opened. Size: {w_vid}x{h_vid}")
+    
+    # Setup Camera Matrix
+    # Setup Camera Matrix
+    if isinstance(video_source, int):
+        print("Using Generic Webcam Calibration...")
+        K = get_generic_calibration(w_vid, h_vid)
+        # Assume no distortion for webcam if unknown
+        dist_cal_run = np.zeros(5) 
+    else:
+        print("Using Default Calibration...")
+        K = get_camera_matrix(w_vid, h_vid)
+        dist_cal_run = dist_cal
 
+    newK, roi = cv2.getOptimalNewCameraMatrix(K, dist_cal_run, (w_vid,h_vid), alpha=0)
+    map1, map2 = cv2.initUndistortRectifyMap(K, dist_cal_run, None, newK, (w_vid,h_vid), cv2.CV_16SC2)
+
+    # Initialize Modules
     placement = PlacementController(frame0)
     tracker = FeatureTracker()
-    renderer = MeshRenderer3D(MODEL, K, w, h)
+    try:
+        renderer = MeshRenderer3D(args.model, K, w_vid, h_vid)
+    except Exception as e:
+        print(f"Failed to initialize renderer: {e}")
+        return
     
     # Interaction State
-    obj_scale = 10.0
-    obj_angle_x = 0.0
-    obj_angle_y = 0.0
-    obj_angle_z = 0.0
+    obj_state = {
+        "scale": 10.0,
+        "rx": 0.0, "ry": 0.0, "rz": 0.0
+    }
 
     # Stabilization & Geometry
-    pose_filter = PoseFilter(alpha=0.7) # Higher alpha = less lag, more responsiveness
-    Z_PLANE = 20.0 # Assumed distance to the plane for scale recovery
+    pose_filter = PoseFilter(alpha=0.7) 
+    # FIXED_DEPTH = 20.0 # Virtual distance to place object
     
-    last_frame = frame0.copy()
-
     cv2.namedWindow("AR3D")
     cv2.setMouseCallback("AR3D", placement.mouse_callback)
 
     frame_idx = 0
+    print("\nControls:")
+    print("  [Click]: Place & Lock Object here")
+    # print("  [C]: Lock/Confirm Placement") # Removed as it's now click-to-lock
+    print("  [R]: Reset")
+    print("  [+/-]: Scale")
+    print("  [W/S]: Rotate X (Pitch)")
+    print("  [A/D]: Rotate Y (Yaw)")
+    print("  [G/E]: Rotate Z (Roll)")
+    print("  [ESC]: Quit\n")
+
     while True:
         ret, frame = cap.read()
         if not ret:
-            # Loop the video
-            print("End of video, looping...")
+            # Video Loop
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            
-            # Reset tracker on loop, as the scene changes instantly
             if placement.locked:
-                 print("Video looped: Resetting tracker.")
                  tracker.initialized = False
-                 # Optional: Unset lock if you want user to re-lock
-                 # placement.locked = False
-                 # placement.anchor = None
-            
             continue
             
         frame_idx += 1
         
+        # Undistort
         frame = cv2.remap(frame, map1, map2, interpolation=cv2.INTER_LINEAR)
-
         display = frame.copy()
 
-        if placement.anchor and not placement.locked:
-            display = placement.draw_preview(display)
-
+        # Logic
         if placement.locked:
+            # Object IS locked
             if not tracker.initialized:
                 tracker.initialize(placement.initial_frame, placement.roi_corners)
-                
-                # UNPROJECT anchor to 3D
-                # (Logic kept for reference but we lock to 2D ray now)
-                
-                # We treat the object as centered at the origin of the coordinate system
-                # and move it using 't' in the loop.
                 renderer.set_anchor_pos([0,0,0])
                 pose_filter.reset()
 
-            # Tracker now returns H from Initial -> Current
+            # Tracking
             H, p_init, p_curr = tracker.track(frame)
             
             if H is not None:
-                # 1. Compute robust 2D anchor position using H
-                # This guarantees the point stays visually "stuck" to the texture
+                # 1. Map anchor to current frame
                 ux, uy = placement.anchor
                 anchor_hom = np.array([ux, uy, 1.0])
                 curr_anchor_hom = H @ anchor_hom
                 cur_u, cur_v = curr_anchor_hom[:2] / curr_anchor_hom[2]
                 
-                # 2. Recover Rotation (Orientation) from Homography
-                # We use the previous R to maintain consistency
+                # 2. Rotation & Translation
                 prev_R = pose_filter.R_curr if pose_filter.initialized else None
                 R, _ = decompose_homography(H, K, prev_R)
                 
-                # 3. Construct Translation to force object to appear at (cur_u, cur_v) at fixed depth
-                # We place the object at (0,0,0) in World, so X_cam = t_final.
-                # We want t_final to project to (cur_u, cur_v).
-                # t_final = K_inv * [u, v, 1] * Fixed_Depth
-                FIXED_DEPTH = 20.0 # Fixed depth to ensure visibility (meters/units)
+                # 3. Forced Translation (Ray casting)
+                # We force the object to lie on the ray passing through (cur_u, cur_v) at fixed depth
+                FIXED_DEPTH = 20.0 
                 K_inv = np.linalg.inv(K)
                 ray = K_inv @ np.array([cur_u, cur_v, 1.0])
-                
-                # ray is (x_norm, y_norm, 1.0). Scaling by Z gives (X, Y, Z).
                 t_forced = ray * FIXED_DEPTH
                 
-                # 4. Filter/Smooth
-                # For translation, we use the forced 2D position to prevent drift
+                # 4. Filter
                 R_smooth, t_smooth = pose_filter.update(R, t_forced)
                 
-                # Debug Logging
-                if frame_idx % 30 == 0:
-                    print(f"\n[Debug Frame {frame_idx}]")
-                    print(f"  Tracked 2D: ({cur_u:.1f}, {cur_v:.1f})")
-                    print(f"  t_forced: {t_smooth.flatten()}")
-                    # Reset object anchor to zero since we are moving the camera frame directly to the object center
-                    renderer.object_pos = np.array([0.0, 0.0, 0.0])
-                
-                # Render (Note: we treat object as centered at 0,0,0, so we pass t_smooth as the translation)
-                # Render
-                print(f"[Debug Rot] X:{obj_angle_x} Y:{obj_angle_y} Z:{obj_angle_z}")
-                model_rgba = renderer.render(R_smooth, t_smooth, 
-                                           rot_x=obj_angle_x, 
-                                           rot_y=obj_angle_y, 
-                                           rot_z=obj_angle_z, 
-                                           scale=obj_scale)
+                # 5. Render
+                try:
+                    model_rgba = renderer.render(R_smooth, t_smooth, 
+                                               rot_x=obj_state["rx"], 
+                                               rot_y=obj_state["ry"], 
+                                               rot_z=obj_state["rz"], 
+                                               scale=obj_state["scale"])
 
-                mask = model_rgba[:,:,3] > 0
-                display[mask] = model_rgba[:,:,:3][mask]
-
+                    mask = model_rgba[:,:,3] > 0
+                    display[mask] = model_rgba[:,:,:3][mask]
+                except Exception as e:
+                    pass # Prevent crash on render fail
+                    
             else:
                  cv2.putText(display, "Tracking Lost", (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+        
+        else:
+            # Object NOT locked (Preview Mode)
+            if placement.anchor:
+                 display = placement.draw_preview(display)
 
-        # GUI Instructions
-        # GUI Instructions
-        cv2.putText(display, "Press 'c' to lock", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
-        cv2.putText(display, f"Scale (+/-): {obj_scale:.1f}", (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
-        cv2.putText(display, f"Rot X(w/s) Y(a/d) Z(g/e)", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
-        cv2.putText(display, f"Angles: {obj_angle_x:.0f}, {obj_angle_y:.0f}, {obj_angle_z:.0f}", (20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+        # UI Overlay
+        cv2.putText(display, "FPS: N/A", (w_vid-100, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+        status_text = "LOCKED" if placement.locked else "SELECT POINT"
+        cv2.putText(display, f"Status: {status_text}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+        
+        # Debug State
+        state_str = f"S:{obj_state['scale']:.1f} RX:{obj_state['rx']:.1f} RY:{obj_state['ry']:.1f} RZ:{obj_state['rz']:.1f}"
+        cv2.putText(display, state_str, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,100,255), 2)
 
+        # Controls Overlay
+        controls = [
+            "Controls:",
+            "[Click]: Place Object",
+            "[R]: Reset",
+            "[+/-]: Scale",
+            "[W/S]: Rotate X",
+            "[A/D]: Rotate Y",
+            "[G/E]: Rotate Z",
+            "[ESC]: Quit"
+        ]
+        
+        y_start = h_vid - (len(controls) * 25) - 20 # Position at bottom left
+        for i, text in enumerate(controls):
+            cv2.putText(display, text, (20, y_start + i*25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
+        
+        # Show Controls overlay
         cv2.imshow("AR3D", display)
-        last_frame = frame.copy()
-
+        
         key = cv2.waitKey(10)
-        if key == ord('q'):
+        if key == 27: # ESC
             break
         elif key == ord('c'):
             placement.lock()
-            # Reset tracker if unlocking?
-            if not placement.locked:
-                tracker.initialized = False
+        elif key == ord('r'):
+            print("Resetting...")
+            placement.locked = False
+            placement.anchor = None
+            tracker.initialized = False
+            pose_filter.reset()
         
-        # Interaction Keys
-        elif key == ord('='): # Scale Up (+)
-            obj_scale += 1.0
-        elif key == ord('-'): # Scale Down (-)
-            obj_scale = max(1.0, obj_scale - 1.0)
-            
-        # Rotation Controls
-        elif key == ord('w'): # Pitch Up (X+)
-            obj_angle_x += 5.0
-        elif key == ord('s'): # Pitch Down (X-)
-            obj_angle_x -= 5.0
-        elif key == ord('a'): # Yaw Left (Y-)
-            obj_angle_y -= 5.0
-        elif key == ord('d'): # Yaw Right (Y+)
-            obj_angle_y += 5.0
-        elif key == ord('g'): # Roll Left (Z-)
-            obj_angle_z -= 5.0
-        elif key == ord('e'): # Roll Right (Z+)
-            obj_angle_z += 5.0
-            
-        elif key == 27: # ESC to quit
-            break
-            
-    print("Loop finished. Releasing resources.")
-    
-    cap.release()
-    cv2.destroyAllWindows()
+        # Transformations
+        elif key == ord('='): obj_state["scale"] += 0.5
+        elif key == ord('-'): obj_state["scale"] = max(0.1, obj_state["scale"] - 0.5)
+        elif key == ord('w'): obj_state["rx"] += 10.0
+        elif key == ord('s'): obj_state["rx"] -= 10.0
+        elif key == ord('a'): obj_state["ry"] -= 10.0
+        elif key == ord('d'): obj_state["ry"] += 10.0
+        elif key == ord('g'): obj_state["rz"] -= 10.0
+        elif key == ord('e'): obj_state["rz"] += 10.0
 
+    cap.release()
+    renderer.close()
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
+

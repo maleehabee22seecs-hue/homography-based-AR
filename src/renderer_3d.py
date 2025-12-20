@@ -7,13 +7,15 @@ class MeshRenderer3D:
     def __init__(self, mesh_path, K, width, height):
         print(f"[MeshRenderer3D] Loading mesh: {mesh_path}")
 
-        # 1. Try newer Open3D Tensor API (supports quads)
+        # 1. Use Legacy Loader with Post-Processing (Crucial for GLB/GLTF materials)
         try:
-            mesh_t = o3d.t.io.read_triangle_mesh(mesh_path)
-            mesh = mesh_t.to_legacy()
-            print("[MeshRenderer3D] Loaded mesh via Tensor API (quad support).")
-        except Exception:
-            print("[MeshRenderer3D] Tensor API failed, falling back to legacy loader.")
+            print("[MeshRenderer3D] Attempting to load with enable_post_processing=True...")
+            mesh = o3d.io.read_triangle_mesh(mesh_path, enable_post_processing=True)
+            if not mesh.has_triangles():
+                raise ValueError("Mesh has no triangles or failed to load.")
+            print("[MeshRenderer3D] Loaded mesh successfully.")
+        except Exception as e:
+            print(f"[MeshRenderer3D] Legacy loader failed: {e}. Trying simple load.")
             mesh = o3d.io.read_triangle_mesh(mesh_path)
 
         # 2. Force triangulation
@@ -81,7 +83,10 @@ class MeshRenderer3D:
         
         # Apply "Upside Down" fix (180 around X)
         R_fix = self.mesh.get_rotation_matrix_from_xyz((np.pi, 0, 0))
-        R_obj = R_fix @ R_user
+        
+        # FIX: Apply R_fix FIRST (to upright the model), THEN apply user rotation.
+        # Matrix order: V_new = R_user * (R_fix * V)
+        R_obj = R_user @ R_fix
         
         # We need to transform the BASE vertices to the new position
         # V_new = (R_obj * V_base) * scale

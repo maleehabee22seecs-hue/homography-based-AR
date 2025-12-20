@@ -14,6 +14,7 @@ class PlacementController:
             self.anchor = (x, y)
             self._compute_roi()
             print("Anchor selected at:", self.anchor)
+            self.lock() # Immediate lock
 
     def _compute_roi(self):
         x, y = self.anchor
